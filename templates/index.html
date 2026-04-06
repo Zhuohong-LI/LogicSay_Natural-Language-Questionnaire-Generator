@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<!--
+  这是前端页面：
+  - 负责收集用户需求
+  - 调用后端 API 生成/修改问卷
+  - 展示问卷预览、逻辑跳转指引
+  - 把问卷导出为“问卷星可粘贴文本”
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 让移动端按设备宽度渲染，避免页面缩放异常 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>自然语言问卷生成器</title>
+  <style>
+    /* 页面整体：居中、浅背景、留白 */
+    body {
+      margin: 0;
+      font-family: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background-color: #f4f7fb;
+      color: #222;
+      display: flex;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    /* 主容器：限制最大宽度，卡片化外观 */
+    .container {
+      width: min(100%, 980px);
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 8px 25px rgba(20, 40, 70, 0.08);
+      padding: 24px;
+      box-sizing: border-box;
+    }
+
+    /* 主标题 */
+    h1 {
+      margin: 0 0 16px;
+      font-size: 1.9rem;
+      color: #1a2a4b;
+    }
+
+    /* 段落描述文字 */
+    p {
+      color: #5a6270;
+      margin-top: 0;
+    }
+
+    /* 每个表单区块统一下边距 */
+    .field-group {
+      margin-bottom: 20px;
+    }
+
+    /* 首次访问引导卡片 */
+    .onboarding-card {
+      position: relative;
+      background: #e6f7ff;
+      border: 1px solid #b7e3ff;
+      border-radius: 10px;
+      padding: 14px 16px 12px;
+      margin-bottom: 12px;
+      color: #16345e;
+      line-height: 1.58;
+    }
+
+    .onboarding-title {
+      margin: 0 28px 8px 0;
+      font-size: 16px;
+      font-weight: 600;
+      color: #11457a;
+    }
+
+    .onboarding-list {
+      margin: 0;
+      padding-left: 20px;
+      color: #1a3f67;
+    }
+
+    .onboarding-tip {
+      margin: 10px 0 8px;
+      color: #22527f;
+    }
+
+    .onboarding-footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+      font-size: 14px;
+      color: #274f77;
+    }
+
+    .onboarding-footer input {
+      margin: 0;
+    }
+
+    .guide-close-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: #356793;
+      font-size: 17px;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background-color 0.15s ease, color 0.15s ease;
+    }
+
+    .guide-close-btn:hover {
+      background: rgba(255, 255, 255, 0.7);
+      color: #16345e;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .guide-reopen-btn {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 40;
+      padding: 9px 14px;
+      border: 1px solid #b7d8f7;
+      box-shadow: 0 4px 14px rgba(36, 59, 119, 0.16);
+    }
+
+    /* 模板库卡片区域 */
+    .template-library {
+      margin: 0 0 12px;
+    }
+
+    .template-library-title {
+      margin: 0 0 8px;
+      font-size: 15px;
+      font-weight: 600;
+      color: #243b77;
+    }
+
+    .template-list {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding: 2px 2px 8px;
+      scrollbar-width: thin;
+    }
+
+    .template-card {
+      flex: 0 0 auto;
+      min-width: 230px;
+      max-width: 300px;
+      padding: 12px;
+      border: 1px solid #e0e3e8;
+      border-radius: 10px;
+      background: #f5f6f8;
+      text-align: left;
+      color: #1f2d3d;
+      box-shadow: none;
+    }
+
+    .template-card:hover {
+      transform: translateY(-1px);
+      background: #f9fafb;
+      box-shadow: 0 6px 16px rgba(40, 54, 77, 0.12);
+    }
+
+    .template-card.active {
+      border-color: #9ebcf5;
+      background: #edf3ff;
+      box-shadow: 0 0 0 2px rgba(99, 137, 214, 0.18);
+    }
+
+    .template-card-name {
+      margin: 0 0 6px;
+      font-size: 15px;
+      font-weight: 600;
+      color: #1d335a;
+    }
+
+    .template-card-desc {
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #5a6270;
+    }
+
+    /* 文本域样式（需求输入/修改指令） */
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      border: 1px solid #d4d6dc;
+      border-radius: 8px;
+      padding: 12px;
+      box-sizing: border-box;
+      resize: vertical;
+      font-size: 16px;
+      font-family: "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif;
+      background: #fafafa;
+    }
+
+    /* 单行输入框和下拉框统一样式 */
+    input[type='text'],
+    select {
+      width: 100%;
+      border: 1px solid #d4d6dc;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 16px;
+      box-sizing: border-box;
+      background: #fff;
+    }
+
+    /* 按钮容器：横向排列，可换行 */
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    /* 按钮基础样式 */
+    button {
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      cursor: pointer;
+      font-size: 15px;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    /* 鼠标悬停时微抬起 */
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+    }
+
+    /* 禁用状态：灰化并取消悬停动效 */
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.65;
+      transform: none;
+      box-shadow: none;
+    }
+
+    /* 三种按钮语义颜色 */
+    .primary { background: #3366ff; color: #fff; }
+    .secondary { background: #f1f5fb; color: #243b77; }
+    .danger { background: #f44336; color: #fff; }
+
+    /* 问卷预览区域：保留换行，使用等宽字体 */
+    .preview {
+      background: #fafafa;
+      border: 1px solid #d4d6dc;
+      border-radius: 8px;
+      min-height: 180px;
+      padding: 14px;
+      font-family: "Courier New", Courier, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      color: #172032;
+    }
+
+    /* 逻辑跳转说明区域：黄色提示风格 */
+    .logic-guide {
+      background: #fff8e7;
+      border: 1px solid #f1d9a5;
+      border-radius: 8px;
+      min-height: 120px;
+      padding: 14px;
+      font-size: 15px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      color: #4f3f15;
+    }
+
+    /* 状态提示（处理中/成功） */
+    .status {
+      margin-top: 10px;
+      line-height: 1.4;
+      color: #334870;
+    }
+
+    /* 错误提示（红色） */
+    .error {
+      color: #d93025;
+      margin-top: 8px;
+    }
+
+    /* 手机端适配：减小边距，按钮改全宽 */
+    @media (max-width: 620px) {
+      body { padding: 12px; }
+      .container { padding: 16px; }
+      button { width: 100%; }
+      .button-row { gap: 8px; }
+      .guide-reopen-btn {
+        width: auto;
+        right: 12px;
+        bottom: 12px;
+      }
+      .guide-close-btn {
+        width: 28px;
+      }
+      .template-card {
+        width: auto;
+        min-width: 210px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>自然语言问卷生成器</h1>
+    <p>输入需求，AI 自动生成问卷结构；可继续修改与导出。</p>
+    <button id="reopenGuideBtn" class="secondary guide-reopen-btn" type="button" style="display: none;">
+      重新显示引导
+    </button>
+
+    <!-- 生成问卷区域：模型选择 + 需求输入 -->
+    <div class="field-group">
+      <div style="margin-bottom: 10px;">
+        <label for="modelSelect">选择模型：</label>
+        <select id="modelSelect">
+          <option value="deepseek-r1" selected>deepseek-r1</option>
+          <option value="qwen">备用模式（通义千问）</option>
+        </select>
+      </div>
+      <div id="onboardingCard" class="onboarding-card">
+        <button id="closeGuideBtn" class="guide-close-btn" type="button" aria-label="关闭引导">×</button>
+        <div class="onboarding-title">使用说明</div>
+        <ol class="onboarding-list">
+          <li>优先从模板库点击模板，可直接加载预设问卷结构</li>
+          <li>也可输入问卷需求，点击“生成问卷”由 AI 生成结构</li>
+          <li>不满意时，输入修改指令（例如：“把第二题改成多选题”）</li>
+          <li>点击“复制问卷星文本”，粘贴到问卷星即可</li>
+          <li>查看“逻辑跳转指引”，在问卷星中手动配置跳转</li>
+        </ol>
+        <div class="onboarding-tip">提示：模板加载后可直接使用“修改”功能；生成后可切换模型。</div>
+        <label class="onboarding-footer">
+          <input id="dontShowAgain" type="checkbox" />
+          不再显示
+        </label>
+      </div>
+      <div class="template-library">
+        <div class="template-library-title">模板库</div>
+        <div id="templateList" class="template-list"></div>
+      </div>
+      <label for="needText">问卷需求</label>
+      <textarea id="needText" placeholder="例如：我是学生会负责人，要招募志愿者，大一新生跳转基础信息题，有经验的同学直接问实操经验"></textarea>
+    </div>
+
+    <!-- 生成和复制按钮 -->
+    <div class="button-row">
+      <button id="generateBtn" class="primary">生成问卷</button>
+      <button id="exportBtn" class="secondary">复制问卷星文本</button>
+    </div>
+
+    <!-- 修改问卷区域 -->
+    <div class="field-group" style="margin-top: 22px;">
+      <label for="modifyText">修改指令</label>
+      <textarea id="modifyText" placeholder="例如：把第二题改成单选题，选项为'是/否'"></textarea>
+      <div class="button-row" style="margin-top: 10px;">
+        <button id="modifyBtn" class="primary">修改</button>
+      </div>
+    </div>
+
+    <!-- 问卷文本预览 -->
+    <div class="field-group">
+      <label>问卷预览</label>
+      <div id="preview" class="preview">请先生成问卷。</div>
+    </div>
+
+    <!-- 给问卷星手动配置“题目关联”的指导文字 -->
+    <div class="field-group">
+      <label>逻辑跳转手动设置指引</label>
+      <div id="logicGuide" class="logic-guide">当前问卷没有逻辑跳转，无需配置</div>
+    </div>
+
+    <!-- 状态和错误信息 -->
+    <div id="status" class="status"></div>
+    <div id="error" class="error" style="display: none;"></div>
+  </div>
+
+  <script>
+    // 缓存页面上的核心 DOM 元素，后续直接用，避免重复查询。
+    const generateBtn = document.getElementById('generateBtn');
+    const modifyBtn = document.getElementById('modifyBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const modelSelect = document.getElementById('modelSelect');
+    const needText = document.getElementById('needText');
+    const modifyText = document.getElementById('modifyText');
+    const preview = document.getElementById('preview');
+    const logicGuide = document.getElementById('logicGuide');
+    const status = document.getElementById('status');
+    const error = document.getElementById('error');
+    const onboardingCard = document.getElementById('onboardingCard');
+    const closeGuideBtn = document.getElementById('closeGuideBtn');
+    const dontShowAgain = document.getElementById('dontShowAgain');
+    const reopenGuideBtn = document.getElementById('reopenGuideBtn');
+    const templateList = document.getElementById('templateList');
+
+    // 当前会话 ID：后端用于识别“同一份问卷”的修改上下文。
+    let currentSessionId = null;
+    // 当前问卷对象：用于预览显示和复制导出。
+    let currentSurvey = null;
+
+    const ONBOARDING_STORAGE_KEY = 'survey_generator_hide_onboarding';
+    const templates = [
+      {
+        name: '活动报名模板',
+        description: '收集姓名、学号、学院、参与时间段（无跳转）',
+        requirement: '做一个校园活动报名问卷，收集姓名、学号、学院、可参与时间段（周六上午/下午、周日上午/下午）。',
+        survey: {
+          title: '校园活动报名表',
+          description: '请填写以下信息完成活动报名。',
+          questions: [
+            {
+              id: 'q1',
+              title: '您的姓名',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q2',
+              title: '您的学号',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q3',
+              title: '您所在的学院',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q4',
+              title: '您可参与的时间段（可多选）',
+              type: 'multiple',
+              options: ['周六上午', '周六下午', '周日上午', '周日下午'],
+              required: true,
+              depends_on: null,
+            },
+          ],
+        },
+      },
+      {
+        name: '课程反馈模板',
+        description: '满意度调查，不满意和一般需填写原因',
+        requirement: '做一个课程反馈问卷。选“非常满意”的直接结束，选“不满意”和“一般”的需要填写具体原因和改进建议。',
+        survey: {
+          title: '课程反馈问卷',
+          description: '感谢您参与本次课程反馈，您的意见将帮助我们改进教学质量。',
+          questions: [
+            {
+              id: 'q1',
+              title: '您对本次课程的整体满意度如何？',
+              type: 'single',
+              options: ['非常满意', '满意', '一般', '不满意'],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q2',
+              title: '请填写您不满意的具体原因和改进建议',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: { question: 'q1', option: '不满意' },
+            },
+            {
+              id: 'q3',
+              title: '请填写您认为需要改进的地方',
+              type: 'text',
+              options: [],
+              required: false,
+              depends_on: { question: 'q1', option: '一般' },
+            },
+          ],
+        },
+      },
+      {
+        name: '志愿者招新模板',
+        description: '收集基本信息 + 根据年级和经验跳转',
+        requirement: '我是学生会负责人，要招募志愿者。大一新生直接问感兴趣的岗位；大二及以上根据是否参加过，问上次岗位或感兴趣的岗位。最后都问时间段。',
+        survey: {
+          title: '校园开放日志愿者招募问卷',
+          description: '欢迎报名参与周末校园开放日志愿服务！请根据您的实际情况填写。',
+          questions: [
+            {
+              id: 'q1',
+              title: '您的姓名',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q2',
+              title: '您的学号',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q3',
+              title: '您所在的学院',
+              type: 'text',
+              options: [],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q4',
+              title: '您的年级是？',
+              type: 'single',
+              options: ['大一', '大二及以上'],
+              required: true,
+              depends_on: null,
+            },
+            {
+              id: 'q5',
+              title: '您本次感兴趣的志愿者岗位类型是？',
+              type: 'multiple',
+              options: ['引导接待', '展位讲解', '后勤支持', '摄影记录', '机动协调'],
+              required: true,
+              depends_on: { question: 'q4', option: '大一' },
+            },
+            {
+              id: 'q6',
+              title: '您之前是否参加过校园开放日志愿者活动？',
+              type: 'single',
+              options: ['是', '否'],
+              required: true,
+              depends_on: { question: 'q4', option: '大二及以上' },
+            },
+            {
+              id: 'q7',
+              title: '您上次参与的岗位类型是？',
+              type: 'single',
+              options: ['引导接待', '展位讲解', '后勤支持', '摄影记录', '机动协调'],
+              required: true,
+              depends_on: { question: 'q6', option: '是' },
+            },
+            {
+              id: 'q8',
+              title: '您本次感兴趣的志愿者岗位类型是？',
+              type: 'multiple',
+              options: ['引导接待', '展位讲解', '后勤支持', '摄影记录', '机动协调'],
+              required: true,
+              depends_on: { question: 'q6', option: '否' },
+            },
+            {
+              id: 'q9',
+              title: '您的可参与时间段是？（可多选）',
+              type: 'multiple',
+              options: ['周六上午 8:00-12:00', '周六下午 13:00-17:00', '周日上午 8:00-12:00', '周日下午 13:00-17:00'],
+              required: true,
+              depends_on: null,
+            },
+          ],
+        },
+      },
+    ];
+
+    // 克隆模板问卷，避免后续操作误改模板原始数据。
+    const cloneSurvey = (survey) => {
+      if (typeof structuredClone === 'function') {
+        return structuredClone(survey);
+      }
+      return JSON.parse(JSON.stringify(survey));
+    };
+
+    // 控制引导显示/隐藏，并在隐藏时露出“重新显示引导”按钮。
+    const setOnboardingVisible = (visible) => {
+      onboardingCard.style.display = visible ? 'block' : 'none';
+      reopenGuideBtn.style.display = visible ? 'none' : 'inline-flex';
+    };
+
+    // 读取“是否不再显示引导”标记；隐私模式等异常时默认展示。
+    const readHideOnboarding = () => {
+      try {
+        return localStorage.getItem(ONBOARDING_STORAGE_KEY) === '1';
+      } catch (err) {
+        return false;
+      }
+    };
+
+    // 写入/移除本地标记。
+    const writeHideOnboarding = (shouldHide) => {
+      try {
+        if (shouldHide) {
+          localStorage.setItem(ONBOARDING_STORAGE_KEY, '1');
+        } else {
+          localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+        }
+      } catch (err) {
+        // 忽略 localStorage 异常，不影响主流程。
+      }
+    };
+
+    // 渲染模板库卡片。
+    const renderTemplateLibrary = () => {
+      templateList.innerHTML = '';
+      templates.forEach((tpl, index) => {
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'template-card';
+        card.setAttribute('aria-label', tpl.name);
+
+        const name = document.createElement('p');
+        name.className = 'template-card-name';
+        name.textContent = tpl.name;
+
+        const desc = document.createElement('p');
+        desc.className = 'template-card-desc';
+        desc.textContent = tpl.description;
+
+        card.appendChild(name);
+        card.appendChild(desc);
+        card.addEventListener('click', async () => {
+          const surveyFromTemplate = cloneSurvey(tpl.survey);
+          try {
+            const data = await apiPost('/api/template/load', { survey: surveyFromTemplate });
+            currentSessionId = data.session_id;
+            currentSurvey = data.survey || surveyFromTemplate;
+
+            showPreview(currentSurvey);
+            showLogicGuide(currentSurvey);
+            needText.value = tpl.requirement;
+            needText.focus();
+            needText.setSelectionRange(needText.value.length, needText.value.length);
+
+            templateList.querySelectorAll('.template-card').forEach((el, i) => {
+              el.classList.toggle('active', i === index);
+            });
+
+            error.style.display = 'none';
+            status.textContent = '模板问卷已加载，可直接使用“修改”功能。';
+          } catch (err) {
+            showError('模板加载失败：' + err.message);
+          }
+        });
+        templateList.appendChild(card);
+      });
+    };
+
+    // 切换“加载中”状态：
+    // - 禁用按钮，防止重复点击
+    // - 显示处理中提示
+    // - 结束加载时隐藏错误区
+    const setLoading = (isLoading) => {
+      generateBtn.disabled = isLoading;
+      modifyBtn.disabled = isLoading;
+      exportBtn.disabled = isLoading;
+      status.textContent = isLoading ? '处理中，请稍候...' : '';
+      if (!isLoading) {
+        error.style.display = 'none';
+      }
+    };
+
+    // 统一显示错误信息。
+    const showError = (msg) => {
+      error.style.display = 'block';
+      error.textContent = msg;
+      status.textContent = '';
+    };
+
+    // 把 survey 对象渲染为“人类可读”的文本预览。
+    const showPreview = (survey) => {
+      // 没有有效问卷时给兜底提示。
+      if (!survey || !survey.title) {
+        preview.textContent = '无可用问卷数据';
+        return;
+      }
+
+      // 从标题开始拼接多行文本。
+      let content = `问卷标题：${survey.title}\n`;
+      if (survey.description) content += `说明：${survey.description}\n`;
+      content += '\n题目列表：\n';
+
+      // 遍历题目并输出题干、题型、必填、依赖、选项。
+      (survey.questions || []).forEach((q, index) => {
+        const required = q.required ? '（必答）' : '（可选）';
+        let depends = '';
+
+        // depends_on 要求是对象，其他格式都报“依赖格式错误”提示。
+        if (q.depends_on) {
+          if (typeof q.depends_on === 'object' && !Array.isArray(q.depends_on)) {
+            const depQ = q.depends_on.question;
+            const depOpt = q.depends_on.option;
+            depends = depQ && depOpt
+              ? `  依赖：${depQ}=${depOpt}`
+              : `  依赖格式错误：${JSON.stringify(q.depends_on)}`;
+          } else {
+            depends = `  依赖格式错误：${JSON.stringify(q.depends_on)}`;
+          }
+        }
+
+        content += `${index + 1}. ${q.title} [${q.type}] ${required}${depends}\n`;
+
+        // 单选/多选才输出选项（用 a/b/c... 编号）。
+        if (q.type === 'single' || q.type === 'multiple') {
+          (q.options || []).forEach((opt, oi) => {
+            content += `   ${String.fromCharCode(97 + oi)}. ${opt}\n`;
+          });
+        }
+      });
+
+      preview.textContent = content;
+    };
+
+    // 根据 depends_on 自动生成“问卷星手动配置步骤”。
+    const showLogicGuide = (survey) => {
+      const questions = (survey && survey.questions) || [];
+      if (!questions.length) {
+        logicGuide.textContent = '当前问卷没有逻辑跳转，无需配置';
+        return;
+      }
+
+      // 先建立题号 -> 元信息映射，方便后续快速查找“依赖的是哪一题”。
+      const questionMetaById = new Map();
+      questions.forEach((q, index) => {
+        if (q && q.id) {
+          questionMetaById.set(String(q.id), { index, title: q.title || '' });
+        }
+      });
+
+      const lines = ['【逻辑跳转配置指南】', ''];
+      let hasLogic = false;
+
+      questions.forEach((q, index) => {
+        const dependsOn = q && q.depends_on;
+        // 非对象或数组都视为无效依赖。
+        if (!dependsOn || typeof dependsOn !== 'object' || Array.isArray(dependsOn)) {
+          return;
+        }
+
+        const depQuestionId = dependsOn.question;
+        const depOption = dependsOn.option;
+        if (!depQuestionId || !depOption) {
+          return;
+        }
+
+        hasLogic = true;
+
+        const targetNumber = index + 1;
+        const targetTitle = q.title || '';
+        const depMeta = questionMetaById.get(String(depQuestionId));
+
+        // 如果能找到依赖题，就用“第X题”；否则退回“题号xxx”。
+        const triggerQuestionText = depMeta
+          ? `第${depMeta.index + 1}题“${depMeta.title}”`
+          : `题号“${depQuestionId}”`;
+        const relatedQuestionText = depMeta ? `第${depMeta.index + 1}题` : `题号“${depQuestionId}”`;
+
+        // 按块输出，每个逻辑跳转都含“触发条件 + 操作步骤”。
+        lines.push(`第${targetNumber}题“${targetTitle}”`);
+        lines.push('');
+        lines.push(`    触发条件：${triggerQuestionText}选“${depOption}”`);
+        lines.push('');
+        lines.push('    在问卷星中的设置方法：');
+        lines.push(`    进入第${targetNumber}题编辑页面 → 点击“题目关联” → 关联到${relatedQuestionText} → 选项“${depOption}”`);
+        lines.push('');
+      });
+
+      if (!hasLogic) {
+        logicGuide.textContent = '当前问卷没有逻辑跳转，无需配置';
+        return;
+      }
+
+      // 去掉末尾多余空行，避免显示上“拖尾”。
+      while (lines.length && lines[lines.length - 1] === '') {
+        lines.pop();
+      }
+      logicGuide.textContent = lines.join('\n');
+    };
+
+    // 把问卷转换为“问卷星可粘贴文本”格式。
+    const formatForWJX = (survey) => {
+      if (!survey || !survey.title) {
+        return '';
+      }
+
+      // 清理题干里括号注释（中英文括号），让导出内容更干净。
+      const cleanQuestionTitle = (title) => String(title || '')
+        .replace(/（[^）]*）/g, '')
+        .replace(/\([^)]*\)/g, '')
+        .trimEnd();
+
+      const questions = survey.questions || [];
+      const lines = [survey.title, ''];
+
+      questions.forEach((q, index) => {
+        const title = cleanQuestionTitle(q.title);
+        // 多选题后缀使用 [多选题]；其他题如果必答则加 *。
+        const suffix = q.type === 'multiple' ? ' [多选题]' : (q.required ? ' *' : '');
+        lines.push(`${index + 1}. ${title}${suffix}`);
+
+        if (q.type === 'text') {
+          // 文本题给一个下划线占位。
+          lines.push('    __________');
+        } else {
+          // 选择题用 A/B/C... 作为选项编号。
+          (q.options || []).forEach((opt, oi) => {
+            const letter = String.fromCharCode(65 + oi);
+            lines.push(`    ${letter}. ${opt}`);
+          });
+        }
+
+        if (index < questions.length - 1) {
+          lines.push('');
+        }
+      });
+
+      return lines.join('\n');
+    };
+
+    // 通用 POST 请求封装：
+    // - 统一 JSON 发送
+    // - 非 2xx 自动抛错
+    // - 成功返回解析后的 JSON
+    const apiPost = async (path, data) => {
+      const resp = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return resp.json();
+    };
+
+    renderTemplateLibrary();
+
+    // 首次打开页面时，若 localStorage 没有“不再显示”标记则展示引导。
+    setOnboardingVisible(!readHideOnboarding());
+
+    // 关闭引导：仅当勾选“不再显示”时，写入 localStorage 标记。
+    closeGuideBtn.addEventListener('click', () => {
+      const shouldHideNextVisit = dontShowAgain.checked;
+      writeHideOnboarding(shouldHideNextVisit);
+      setOnboardingVisible(false);
+    });
+
+    // 角落按钮：清除标记并重新显示引导卡片。
+    reopenGuideBtn.addEventListener('click', () => {
+      dontShowAgain.checked = false;
+      writeHideOnboarding(false);
+      setOnboardingVisible(true);
+      onboardingCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+
+    // 点击“生成问卷”
+    generateBtn.addEventListener('click', async () => {
+      const userInput = needText.value.trim();
+      if (!userInput) {
+        showError('请先输入问卷需求。');
+        return;
+      }
+
+      setLoading(true);
+      try {
+        const data = await apiPost('/api/generate', {
+          user_input: userInput,
+          session_id: currentSessionId,
+          model: modelSelect.value,
+        });
+        currentSessionId = data.session_id;
+        currentSurvey = data.survey;
+        showPreview(data.survey);
+        showLogicGuide(data.survey);
+        status.textContent = '问卷生成成功';
+      } catch (err) {
+        showError('生成失败：' + err.message);
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    // 点击“修改”
+    modifyBtn.addEventListener('click', async () => {
+      if (!currentSessionId) {
+        showError('请先生成问卷，再修改。');
+        return;
+      }
+
+      const modification = modifyText.value.trim();
+      if (!modification) {
+        showError('请填写修改指令。');
+        return;
+      }
+
+      setLoading(true);
+      try {
+        const data = await apiPost('/api/modify', {
+          session_id: currentSessionId,
+          modification,
+          model: modelSelect.value,
+        });
+        currentSurvey = data.survey;
+        showPreview(data.survey);
+        showLogicGuide(data.survey);
+        status.textContent = '修改成功';
+      } catch (err) {
+        showError('修改失败：' + err.message);
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    // 点击“复制文本”
+    exportBtn.addEventListener('click', async () => {
+      if (!currentSurvey) {
+        showError('请先生成问卷，再复制问卷星文本。');
+        return;
+      }
+
+      const text = formatForWJX(currentSurvey);
+      try {
+        // 优先使用现代剪贴板 API（需要 https 或 localhost 环境）。
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          // 兼容旧浏览器：用隐藏 textarea + execCommand('copy')。
+          const tempTextarea = document.createElement('textarea');
+          tempTextarea.value = text;
+          tempTextarea.setAttribute('readonly', '');
+          tempTextarea.style.position = 'fixed';
+          tempTextarea.style.opacity = '0';
+          document.body.appendChild(tempTextarea);
+          tempTextarea.select();
+          const copied = document.execCommand('copy');
+          document.body.removeChild(tempTextarea);
+          if (!copied) {
+            throw new Error('copy failed');
+          }
+        }
+        alert('已复制到剪贴板');
+      } catch (err) {
+        showError('复制失败：' + err.message);
+      }
+    });
+  </script>
+</body>
+</html>
