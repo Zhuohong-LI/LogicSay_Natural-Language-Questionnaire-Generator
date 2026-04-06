@@ -1,4 +1,4 @@
-"""
+﻿"""
 app.py 是这个项目的后端入口文件。
 
 它主要做三件事：
@@ -9,6 +9,7 @@ app.py 是这个项目的后端入口文件。
 
 # uuid: 用来生成全局唯一 ID，这里用于生成 session_id。
 import uuid
+import os
 
 # Dict: 类型标注（Type Hint）里常用的字典类型。
 from typing import Dict
@@ -217,4 +218,5 @@ if __name__ == "__main__":
     # host="0.0.0.0": 允许局域网访问
     # port=5000: 监听端口
     # debug=True: 开发模式（代码改动自动重载、错误页更详细）
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
