@@ -1,15 +1,7 @@
-﻿"""
-app.py 是这个项目的后端入口文件。
-
-它主要做三件事：
-1. 启动 Flask Web 服务。
-2. 提供“生成问卷 / 修改问卷”的 API 路由。
-3. 维护一个内存中的会话字典（session_id -> 当前问卷数据）。
-"""
-
-# uuid: 用来生成全局唯一 ID，这里用于生成 session_id。
+﻿# uuid: 用来生成全局唯一 ID，这里用于生成 session_id。
 import uuid
 import os
+import json
 
 # Dict: 类型标注（Type Hint）里常用的字典类型。
 from typing import Dict
@@ -20,14 +12,32 @@ from typing import Dict
 # render_template: 渲染 HTML 模板
 # request: 读取客户端请求数据
 from flask import Flask, jsonify, render_template, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 
 # 这两个函数来自你自己的 llm_client.py，用于调用大模型：
 # 1) 根据自然语言生成问卷
 # 2) 在已有问卷基础上按要求修改
-from llm_client import call_llm_to_generate_survey, call_llm_to_modify_survey
+from llm_client import (
+    call_llm_to_generate_survey,
+    call_llm_to_generate_survey_stream,
+    call_llm_to_modify_survey,
+    parse_survey_from_text,
+    summarize_modification,
+)
 
 # 创建 Flask 应用实例。__name__ 能让 Flask 知道当前模块的位置。
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
+
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["20 per minute"]
+)
+
+Talisman(app, content_security_policy=None)
 
 # 内存级“会话存储”：
 # 键（key）是 session_id（字符串），值（value）是问卷字典。
@@ -99,6 +109,7 @@ def generate_preview_text(survey_dict: Dict) -> str:
 
 
 @app.route("/api/generate", methods=["POST"])
+@limiter.limit("5 per minute")
 def api_generate():
     """
     生成问卷接口（POST /api/generate）
@@ -119,6 +130,8 @@ def api_generate():
 
     # 提取输入参数。
     user_input = data["user_input"]
+    if len(user_input) > 2000:
+        return jsonify({"error": "输入需求过长，请控制在2000字符以内"}), 400
     model = data.get("model")
 
     # 调用大模型生成问卷结构。
@@ -138,7 +151,79 @@ def api_generate():
     return jsonify({"session_id": session_id, "survey": survey, "preview": preview})
 
 
+@app.route("/api/generate/stream", methods=["POST"])
+@limiter.limit("5 per minute")
+def api_generate_stream():
+    """
+    流式生成问卷接口（POST /api/generate/stream）
+
+    响应类型：
+    - text/event-stream
+    """
+    data = request.get_json(force=True, silent=True)
+    if not data or "user_input" not in data:
+        return jsonify({"error": "missing user_input"}), 400
+
+    user_input = data["user_input"]
+    model = data.get("model")
+    requested_session_id = data.get("session_id")
+
+    def _sse(event: str, payload: Dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def event_stream():
+        full_text_parts = []
+        received_chars = 0
+        try:
+            yield _sse("start", {"message": "stream started"})
+            stream_iter = call_llm_to_generate_survey_stream(user_input, model=model)
+            for chunk in stream_iter:
+                if not chunk:
+                    continue
+                full_text_parts.append(chunk)
+                received_chars += len(chunk)
+                yield _sse("chunk", {"text": chunk, "received_chars": received_chars})
+
+            full_text = "".join(full_text_parts)
+            survey = parse_survey_from_text(full_text)
+            if survey is None:
+                yield _sse("error", {"error": "生成失败：模型返回格式异常，请重试"})
+                yield _sse("done", {"status": "failed"})
+                return
+
+            session_id = requested_session_id or str(uuid.uuid4())
+            sessions[session_id] = survey
+            preview = generate_preview_text(survey)
+            yield _sse(
+                "done",
+                {
+                    "status": "ok",
+                    "session_id": session_id,
+                    "survey": survey,
+                    "preview": preview,
+                    "received_chars": received_chars,
+                },
+            )
+        except GeneratorExit:
+            # 客户端主动断开，不当作服务端错误。
+            return
+        except Exception as ex:
+            yield _sse("error", {"error": f"流式生成异常：{str(ex)}"})
+            yield _sse("done", {"status": "failed"})
+
+    return app.response_class(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.route("/api/template/load", methods=["POST"])
+@limiter.limit("10 per minute")
 def api_template_load():
     """
     模板直载接口（POST /api/template/load）
@@ -164,6 +249,7 @@ def api_template_load():
 
 
 @app.route("/api/modify", methods=["POST"])
+@limiter.limit("10 per minute")
 def api_modify():
     """
     修改问卷接口（POST /api/modify）
@@ -183,6 +269,8 @@ def api_modify():
     # 提取参数。
     session_id = data["session_id"]
     modification = data["modification"]
+    if len(modification) > 500:
+        return jsonify({"error": "修改指令过长，请控制在500字符以内"}), 400
     model = data.get("model")
 
     # 先从内存中取出当前问卷版本。
@@ -194,14 +282,21 @@ def api_modify():
     # 调用大模型，基于 current_survey + modification 产出新版本问卷。
     updated = call_llm_to_modify_survey(current_survey, modification, model=model)
     if updated is None:
-        return jsonify({"error": "修改问卷失败"}), 502
+        return jsonify({"error": "修改失败：模型返回格式异常，请重试或简化指令"}), 502
 
     # 更新内存中的会话数据。
     sessions[session_id] = updated
 
     # 返回更新后的问卷及其文本预览。
     preview = generate_preview_text(updated)
-    return jsonify({"session_id": session_id, "survey": updated, "preview": preview})
+    return jsonify(
+        {
+            "session_id": session_id,
+            "survey": updated,
+            "preview": preview,
+            "modification_summary": summarize_modification(modification),
+        }
+    )
 
 
 @app.route("/")

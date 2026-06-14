@@ -1,317 +1,627 @@
 """
-llm_client.py 负责和大模型 API 通信。
+DeepSeek official API client for the survey generator.
 
-它的核心职责：
-1. 把“用户需求”拼成提示词（prompt）。
-2. 调用远程模型接口。
-3. 尝试从模型返回内容里提取有效 JSON。
-4. 给 app.py 提供两个稳定入口：
-   - 生成问卷
-   - 修改问卷
+This module intentionally uses the OpenAI-compatible Chat Completions format
+documented by DeepSeek:
+https://platform.deepseek.com/api-docs/
 """
 
-# json: 处理 JSON 序列化 / 反序列化
 import json
-# os: 读取环境变量
 import os
-# re: 正则表达式，用于从文本中提取 JSON 片段
 import re
-# traceback: 打印详细异常堆栈，便于排查问题
 import traceback
-# 类型标注工具
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Generator, List, Optional
 
-# requests: 发 HTTP 请求调用模型接口
 import requests
+from dotenv import load_dotenv
 
-# 模型服务接口地址。若环境变量未配置，使用默认占位地址（通常应在 .env 覆盖）。
-API_URL = os.getenv("DASHSCOPE_API_URL", "https://api.dashscope.example.com/v1/chat/completions")
-# 接口鉴权 Key，必须配置，否则无法请求。
-API_KEY = os.getenv("DASHSCOPE_API_KEY")
+load_dotenv()
 
-# 默认模型别名（前端不传 model 时使用）。
-DEFAULT_MODEL_NAME = "deepseek-r1"
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEFAULT_MODEL_NAME = "deepseek-chat"
 
-# 前端可选模型别名 -> 实际模型名称映射。
-# 作用：前端用短名字，后端统一映射成真实模型 ID。
 MODEL_ALIAS_MAP = {
-    "deepseek-r1": "deepseek-r1",
-    "qwen": "qwen-plus-2025-07-28",
-    "qwen-plus-2025-07-28": "qwen-plus-2025-07-28",
+    "": "deepseek-chat",
+    "deepseek": "deepseek-chat",
+    "deepseek-chat": "deepseek-chat",
+    "chat": "deepseek-chat",
+    "deepseek-reasoner": "deepseek-reasoner",
+    "reasoner": "deepseek-reasoner",
+    # Backward-compatible aliases from the previous UI/provider.
+    "deepseek-r1": "deepseek-chat",
+    "deepseek-r1-distill-llama-70b": "deepseek-chat",
+    "qwen": "deepseek-chat",
+    "qwen-plus-2025-07-28": "deepseek-chat",
 }
 
-# 单次请求超时时间（秒）。
-TIMEOUT_SECONDS = 60
-
-# 解析失败时的最大重试次数（请求重试和 JSON 提取都使用这个值）。
+TIMEOUT_SECONDS = 90
 JSON_PARSE_RETRIES = 3
+MAX_TOKENS = 2000
+TEMPERATURE = 0.2
+
+SYSTEM_PROMPT = (
+    "你是一个专业的中文问卷设计助手。"
+    "你必须只输出符合要求的 JSON，不要输出 Markdown、解释、前后缀文本或代码块。"
+)
+
+_VALID_QUESTION_TYPES = {"single", "multiple", "text"}
+_TYPE_ALIASES = {
+    "单选题": "single",
+    "单选": "single",
+    "多选题": "multiple",
+    "多选": "multiple",
+    "文本题": "text",
+    "填空题": "text",
+    "问答题": "text",
+    "文本": "text",
+}
+_CN_NUM_MAP = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
-    """
-    根据前端传入 model 解析最终模型名。
+    requested = (model or "").strip()
+    if requested in MODEL_ALIAS_MAP:
+        return MODEL_ALIAS_MAP[requested]
 
-    规则：
-    - model 为空 -> 用默认模型
-    - model 在映射表中 -> 用映射后的真实模型名
-    - model 不认识 -> 回退默认模型
-    """
-    if not model:
-        return DEFAULT_MODEL_NAME
-    return MODEL_ALIAS_MAP.get(model, DEFAULT_MODEL_NAME)
+    # DeepSeek official Chat Completions currently supports deepseek-chat and
+    # deepseek-reasoner. Unknown frontend values are treated as legacy aliases
+    # and forced to the stable default instead of being sent to the API.
+    print(f"[llm_client] WARNING unsupported model '{requested}', fallback to deepseek-chat")
+    return DEFAULT_MODEL_NAME
 
 
 def _format_prompt_for_generation(user_input: str) -> str:
-    """
-    把“生成问卷”需求拼成给大模型的提示词。
-    提示词要求模型只输出 JSON，且结构固定，减少后续解析失败。
-    """
     return (
-        "请根据以下用户需求生成一份问卷，输出 JSON 格式："
-        "{\"title\": str, \"description\": str, \"questions\": [{\"id\": str, \"title\": str, \"type\": \"single\"|\"multiple\"|\"text\", "
-        "\"options\": [str], \"required\": bool, \"depends_on\": {\"question\": str, \"option\": str}|null}]}。\n"
-        "请只返回有效 JSON，不要返回多余的解释。\n"
+        "请根据以下用户需求生成一份问卷。\n"
+        "输出必须是一个完整 JSON 对象，格式如下：\n"
+        "{\"title\": str, \"description\": str, \"questions\": ["
+        "{\"id\": str, \"title\": str, \"type\": \"single\"|\"multiple\"|\"text\", "
+        "\"options\": [str], \"required\": bool, "
+        "\"depends_on\": {\"question\": str, \"option\": str}|null}"
+        "]}\n"
+        "规则：\n"
+        "1. 只返回 JSON 对象，不要返回 Markdown 或解释。\n"
+        "2. 每道题必须有 id，按 q1、q2、q3 递增。\n"
+        "3. 单选题 type 使用 single，多选题 type 使用 multiple，文本题 type 使用 text。\n"
+        "4. 文本题 options 必须是空数组。\n"
+        "5. depends_on 必须是 {\"question\": \"q1\", \"option\": \"选项文本\"} 或 null。\n"
         f"用户需求：{user_input}"
     )
 
 
-def _format_prompt_for_modification(current_survey_dict: Dict[str, Any], modification: str) -> str:
-    """
-    把“在现有问卷上修改”的需求拼成提示词。
+def _cn_number_to_int(text: str) -> Optional[int]:
+    if not text:
+        return None
+    text = text.strip()
+    if text.isdigit():
+        return int(text)
+    if text == "十":
+        return 10
+    if "十" in text:
+        left, right = text.split("十", 1)
+        tens = _CN_NUM_MAP.get(left, 1 if left == "" else None)
+        if tens is None:
+            return None
+        ones = _CN_NUM_MAP.get(right, 0 if right == "" else None)
+        if ones is None:
+            return None
+        return tens * 10 + ones
+    if len(text) == 1 and text in _CN_NUM_MAP:
+        return _CN_NUM_MAP[text]
+    return None
 
-    注意：
-    - 先把当前问卷转成 JSON 文本，明确告诉模型“当前状态是什么”。
-    - 规则里强调“只改用户要求部分”，避免模型擅自改动其他题目。
-    """
-    # ensure_ascii=False 让中文保持可读，不转 \uXXXX。
+
+def _extract_question_index(text: str) -> Optional[int]:
+    if not text:
+        return None
+
+    m_digit = re.search(r"第\s*(\d+)\s*题", text)
+    if m_digit:
+        return int(m_digit.group(1))
+
+    m_cn = re.search(r"第\s*([零〇一二两三四五六七八九十]+)\s*题", text)
+    if m_cn:
+        return _cn_number_to_int(m_cn.group(1))
+
+    m_qid = re.search(r"\bq(\d+)\b", text, flags=re.I)
+    if m_qid:
+        return int(m_qid.group(1))
+
+    return None
+
+
+def _extract_quoted_texts(text: str) -> List[str]:
+    if not text:
+        return []
+    result: List[str] = []
+    pattern = r"'([^']+)'|\"([^\"]+)\"|“([^”]+)”|‘([^’]+)’"
+    for match in re.finditer(pattern, text):
+        value = next((g for g in match.groups() if g), None)
+        if value:
+            result.append(value.strip())
+    return result
+
+
+def _split_option_items(raw: str) -> List[str]:
+    raw = (raw or "").strip().strip("。；;，,")
+    if not raw:
+        return []
+
+    quoted = _extract_quoted_texts(raw)
+    if quoted:
+        items: List[str] = []
+        for q in quoted:
+            items.extend(re.split(r"[、/,，,;；|]+", q))
+        return [x.strip() for x in items if x.strip()]
+
+    raw = re.sub(r"^(?:为|是|改为|改成|设为|设置为|设置成|修改为)\s*", "", raw)
+    parts = re.split(r"[、/,，,;；|]+", raw)
+    return [x.strip().strip("'\"“”‘’") for x in parts if x.strip()]
+
+
+def _extract_target_type(text: str) -> Optional[str]:
+    for key, value in _TYPE_ALIASES.items():
+        if key in text:
+            return value
+    return None
+
+
+def _extract_target_options(text: str) -> List[str]:
+    m = re.search(r"选项(?:为|改为|改成|设为|设置为|设置成|修改为)?\s*[:：]?\s*(.+)", text)
+    if not m:
+        return []
+    tail = m.group(1)
+    tail = re.split(r"[。；;]", tail)[0]
+    return _split_option_items(tail)
+
+
+def _preprocess_modification(modification: str) -> str:
+    raw = (modification or "").strip()
+    if not raw:
+        return ""
+
+    text = re.sub(r"\s+", " ", raw)
+    q_index = _extract_question_index(text)
+    qid = f"q{q_index}" if q_index else None
+    question_prefix = f"修改题目 {qid}：" if qid else ""
+
+    if re.search(r"(删除|移除|去掉).*(第\s*[零〇一二两三四五六七八九十\d]+\s*题|题目|q\d+)", text):
+        if qid:
+            return f"删除题目 {qid}"
+        m_qid = re.search(r"\bq(\d+)\b", text, flags=re.I)
+        if m_qid:
+            return f"删除题目 q{m_qid.group(1)}"
+
+    if qid and re.search(r"(必答|必填)", text):
+        if re.search(r"(取消|去掉|移除|改为可选|设为可选|非必答|可选)", text):
+            return f"{question_prefix}将 required 改为 false"
+        if re.search(r"(增加|加上|添加|设为|改为|改成|开启|启用|标记)", text):
+            return f"{question_prefix}将 required 改为 true"
+
+    if "选项" in text and re.search(r"(改为|改成|替换为|替换成)", text):
+        quoted = _extract_quoted_texts(text)
+        if len(quoted) >= 2:
+            if qid:
+                return f"{question_prefix}将选项 '{quoted[0]}' 修改为 '{quoted[1]}'"
+            return f"将选项 '{quoted[0]}' 修改为 '{quoted[1]}'"
+
+    if "选项" in text and re.search(r"(删除|移除|去掉)", text):
+        quoted = _extract_quoted_texts(text)
+        if quoted:
+            if qid:
+                return f"{question_prefix}删除选项 '{quoted[0]}'"
+            return f"删除选项 '{quoted[0]}'"
+
+    target_type = _extract_target_type(text)
+    target_options = _extract_target_options(text)
+    if qid and target_type:
+        operations = [f"将 type 改为 '{target_type}'"]
+        if target_options:
+            operations.append(f"options 改为 {json.dumps(target_options, ensure_ascii=False)}")
+        return f"{question_prefix}{'，'.join(operations)}"
+
+    if qid and target_options:
+        return f"{question_prefix}将 options 改为 {json.dumps(target_options, ensure_ascii=False)}"
+
+    if qid and re.search(r"^(把|将)", text):
+        body = re.sub(r"^(把|将)\s*(第\s*[零〇一二两三四五六七八九十\d]+\s*题|q\d+)\s*", "", text)
+        body = body.lstrip("，,:： ").strip()
+        if body:
+            return f"{question_prefix}{body}"
+
+    return text
+
+
+def summarize_modification(modification: str) -> str:
+    normalized = _preprocess_modification(modification)
+    return normalized or (modification or "").strip()
+
+
+def _format_prompt_for_modification(current_survey_dict: Dict[str, Any], modification: str) -> str:
     current = json.dumps(current_survey_dict, ensure_ascii=False)
     return (
-        "你是一个问卷 JSON 编辑助手。给定当前问卷 JSON 和修改指令，输出修改后的完整问卷 JSON。\n"
-        "请严格遵守以下规则：\n"
-        "1. 只修改用户明确要求变更的部分，未提及字段保持不变。\n"
-        "2. 输出必须是完整、可解析的 JSON 对象，不要输出解释、Markdown 或额外文本。\n"
-        "3. 问卷结构固定为：\n"
-        "{\"title\": str, \"description\": str, \"questions\": [{\"id\": str, \"title\": str, \"type\": \"single\"|\"multiple\"|\"text\", \"options\": [str], \"required\": bool, \"depends_on\": {\"question\": str, \"option\": str}|null}]}\n"
-        "4. depends_on 的标准格式必须是 {\"question\": \"q1\", \"option\": \"选项文本\"}，不要缺少 question 或 option。\n"
-        "5. 当前数据结构里，每个题目只支持一个 depends_on 对象或 null，不支持 depends_on 数组。\n"
-        "6. 如果用户说“选择 A 和 B 都需要跳转”，表示要为相关后续题分别设置依赖条件；若同一题需要同时由 A 和 B 触发，由于本结构限制，应拆成两道等价题，分别设置 depends_on 为 A 和 B。\n"
-        "7. 需要新增某个选项的跳转条件时，是新增对应 depends_on，不要误删其他题已有依赖。\n"
+        "你是一个问卷 JSON 编辑助手。给定当前问卷 JSON 和修改指令，请输出修改后的完整问卷 JSON。\n"
+        "输出必须是一个完整 JSON 对象，格式如下：\n"
+        "{\"title\": str, \"description\": str, \"questions\": ["
+        "{\"id\": str, \"title\": str, \"type\": \"single\"|\"multiple\"|\"text\", "
+        "\"options\": [str], \"required\": bool, "
+        "\"depends_on\": {\"question\": str, \"option\": str}|null}"
+        "]}\n"
+        "规则：\n"
+        "1. 只修改用户明确提到的题目或字段，未提及内容必须保持不变。\n"
+        "2. 禁止重排题目顺序，除非用户明确要求调整顺序。\n"
+        "3. 禁止修改未提及的题目标题、题型、选项、必答标记与依赖条件。\n"
+        "4. 只返回 JSON 对象，不要返回 Markdown 或解释。\n"
+        "5. depends_on 必须是 {\"question\": \"q1\", \"option\": \"选项文本\"} 或 null。\n"
+        "6. 删除题目时，仅删除目标题目，其余题目原顺序保留。\n"
         f"当前问卷：{current}\n"
-        f"修改指令：{modification}\n"
-        "只返回修改后的问卷 JSON。"
+        f"修改指令：{modification}"
     )
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """
-    从模型返回文本中尽量提取第一个可解析的 JSON 对象（dict）。
+    if not text:
+        return None
 
-    提取策略（从严格到宽松）：
-    1. 直接整体 json.loads(text)
-    2. 从 ```json ... ``` 代码块中提取
-    3. 用第一对花括号做兜底提取
-    """
-    # 1) 优先尝试“整个文本就是 JSON”。
+    text = text.strip()
+    fallback: Optional[Dict[str, Any]] = None
+
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            return parsed
+            if "questions" in parsed or "title" in parsed:
+                return parsed
+            fallback = parsed
     except json.JSONDecodeError:
         pass
 
-    # 2) 尝试从 Markdown 代码块提取 JSON 主体。
-    matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
-    candidates = matches or []
+    matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I)
+    for candidate in matches:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                if "questions" in parsed or "title" in parsed:
+                    return parsed
+                if fallback is None:
+                    fallback = parsed
+        except json.JSONDecodeError:
+            continue
 
-    # 3) 如果没有代码块，尝试抓取第一个大花括号片段作为候选。
-    if not candidates:
-        curly = re.search(r"\{.*\}", text, flags=re.S)
-        if curly:
-            candidates = [curly.group(0)]
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[idx:])
+            if isinstance(parsed, dict):
+                if "questions" in parsed or "title" in parsed:
+                    return parsed
+                if fallback is None:
+                    fallback = parsed
+        except json.JSONDecodeError:
+            continue
 
-    # 遍历候选，返回第一个可解析且是 dict 的 JSON。
-    for candidate in candidates:
+    return fallback
+
+
+def _extract_json_loose(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+
+    cleaned = re.sub(r"```(?:json)?", "", text, flags=re.I)
+    cleaned = cleaned.replace("```", "").strip()
+    start = cleaned.find("{")
+    if start >= 0:
+        cleaned = cleaned[start:]
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+
+    for candidate in (cleaned, cleaned.replace("'", "\"")):
         try:
             parsed = json.loads(candidate)
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
             continue
-
     return None
 
 
-def _call_api(prompt: str, model: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    调用远程模型接口并返回问卷字典。
-
-    返回值：
-    - 成功：dict
-    - 失败：None
-    """
-    # 没有 API_KEY 直接失败，避免发送无效请求。
-    if not API_KEY:
-        print("[llm_client] ERROR: DASHSCOPE_API_KEY is not configured")
+def _normalize_question(question: Dict[str, Any], index: int) -> Optional[Dict[str, Any]]:
+    if not isinstance(question, dict):
         return None
 
-    # 解析最终模型名（支持别名）。
-    resolved_model = _resolve_model_name(model)
+    normalized = dict(question)
+    normalized["id"] = str(normalized.get("id") or f"q{index}")
+    normalized["title"] = str(normalized.get("title") or "")
 
-    # 组装 HTTP 请求头。
-    headers = {
+    qtype = str(normalized.get("type") or "text")
+    if qtype not in _VALID_QUESTION_TYPES:
+        qtype = "text"
+    normalized["type"] = qtype
+
+    options = normalized.get("options")
+    if not isinstance(options, list):
+        options = []
+    normalized["options"] = [str(x) for x in options]
+    if qtype == "text":
+        normalized["options"] = []
+
+    normalized["required"] = bool(normalized.get("required", False))
+
+    depends_on = normalized.get("depends_on")
+    if isinstance(depends_on, dict):
+        dep_q = depends_on.get("question")
+        dep_o = depends_on.get("option")
+        if dep_q and dep_o:
+            normalized["depends_on"] = {"question": str(dep_q), "option": str(dep_o)}
+        else:
+            normalized["depends_on"] = None
+    else:
+        normalized["depends_on"] = None
+
+    return normalized
+
+
+def _repair_survey_json(candidate: Any, current_survey_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    parsed: Optional[Dict[str, Any]] = None
+    if isinstance(candidate, dict):
+        parsed = candidate
+    elif isinstance(candidate, str):
+        parsed = _extract_json(candidate) or _extract_json_loose(candidate)
+
+    if not isinstance(parsed, dict):
+        return None
+
+    repaired = dict(parsed)
+
+    if not isinstance(repaired.get("title"), str) or not repaired.get("title", "").strip():
+        fallback_title = current_survey_dict.get("title")
+        repaired["title"] = fallback_title if isinstance(fallback_title, str) and fallback_title.strip() else "未命名问卷"
+
+    if "description" not in repaired or repaired.get("description") is None:
+        repaired["description"] = current_survey_dict.get("description", "")
+    if not isinstance(repaired.get("description"), str):
+        repaired["description"] = str(repaired.get("description"))
+
+    questions_raw = repaired.get("questions")
+    if not isinstance(questions_raw, list):
+        questions_raw = current_survey_dict.get("questions", [])
+        if not isinstance(questions_raw, list):
+            questions_raw = []
+
+    normalized_questions: List[Dict[str, Any]] = []
+    for idx, q in enumerate(questions_raw, start=1):
+        qn = _normalize_question(q, idx)
+        if qn is not None:
+            normalized_questions.append(qn)
+    repaired["questions"] = normalized_questions
+
+    if "title" not in repaired or "questions" not in repaired:
+        return None
+    return repaired
+
+
+def _extract_content_from_response(response_json: Dict[str, Any]) -> Optional[str]:
+    try:
+        content = response_json["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return None
+    return str(content)
+
+
+def _build_headers() -> Optional[Dict[str, str]]:
+    if not API_KEY:
+        print("[llm_client] ERROR: DEEPSEEK_API_KEY is not configured")
+        return None
+
+    return {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     }
 
-    # 组装请求体（具体格式取决于你接入的平台协议）。
-    payload = {
-        "model": resolved_model,
-        "input": {
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        },
-        "parameters": {
-            "result_format": "message",
-            "max_tokens": 1500,
-            "temperature": 0.2
-        }
+
+def _build_payload(prompt: str, model: Optional[str] = None, stream: bool = False) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": _resolve_model_name(model),
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
     }
+    if stream:
+        payload["stream"] = True
+    return payload
 
-    # 调试日志：帮助定位请求参数、模型和接口地址。
-    print("[llm_client] DEBUG _call_api 请求开始")
-    print(f"[llm_client] DEBUG API_URL={API_URL}")
-    print(f"[llm_client] DEBUG MODEL={resolved_model}")
-    print("[llm_client] DEBUG headers={'Authorization': '***', 'Content-Type': 'application/json'}")
-    print(f"[llm_client] DEBUG payload={json.dumps(payload, ensure_ascii=False)[:500]}...")
 
-    # 预留变量（当前实现中一般仍为 None；保留原逻辑不改）。
-    response_text = None
-
-    # 请求重试循环。
-    for attempt in range(JSON_PARSE_RETRIES):
-        try:
-            print(f"[llm_client] DEBUG attempt={attempt+1}/{JSON_PARSE_RETRIES} 请求发送中...")
-            resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT_SECONDS)
-            print(f"[llm_client] DEBUG HTTP status={resp.status_code}")
-            try:
-                print(f"[llm_client] DEBUG HTTP headers={dict(resp.headers)}")
-            except Exception as ex:
-                print(f"[llm_client] WARNING 无法读取响应头: {ex}")
-
-            # HTTP 非 200：按失败处理，未到最大次数则重试。
-            if resp.status_code != 200:
-                print(f"[llm_client] ERROR 接口返回非200状态码: {resp.status_code}")
-                print(f"[llm_client] ERROR 响应正文: {resp.text[:2000]}")
-                # 502 等通常表示上游不稳定，可重试。
-                if attempt < JSON_PARSE_RETRIES - 1:
-                    continue
-                else:
-                    return None
-
-            # HTTP 200 时先解析 JSON。
-            response_json = resp.json()
-            print(f"[llm_client] DEBUG 响应正文片段: {json.dumps(response_json, ensure_ascii=False)[:2000]}")
-
-            # 按约定路径提取 content。
-            try:
-                content = response_json["output"]["choices"][0]["message"]["content"]
-                print(f"[llm_client] DEBUG 提取的 content: {content[:500]}...")
-            except (KeyError, IndexError) as ex:
-                print(f"[llm_client] ERROR 响应结构异常: {ex}")
-                if attempt < JSON_PARSE_RETRIES - 1:
-                    continue
-                else:
-                    return None
-
-            # 从 content 中提取 JSON。
-            result = _extract_json(content)
-            if result is not None:
-                print("[llm_client] DEBUG JSON 解析成功")
-                return result
-            else:
-                print("[llm_client] DEBUG JSON 解析失败，准备重试")
-                if attempt < JSON_PARSE_RETRIES - 1:
-                    continue
-                else:
-                    return None
-
-        except requests.RequestException as err:
-            # 网络超时、DNS、连接中断等异常。
-            print(f"[llm_client] ERROR 请求异常: {err}")
-            traceback.print_exc()
-            if attempt == JSON_PARSE_RETRIES - 1:
-                return None
-            print("[llm_client] DEBUG 发生异常，准备重试")
-            continue
-
-    # 下面这段是保留的兜底逻辑（在当前 return 路径下通常不会执行到）。
-    # 保持原样是为了不改变原有行为。
-    if response_text is None:
-        print("[llm_client] ERROR response_text 为 None，放弃解析")
+def _call_api_for_content(prompt: str, model: Optional[str] = None, retries: int = JSON_PARSE_RETRIES) -> Optional[str]:
+    headers = _build_headers()
+    if headers is None:
         return None
 
-    # 兜底：尝试多次从 response_text 提取 JSON。
-    for attempt in range(JSON_PARSE_RETRIES):
-        print(f"[llm_client] DEBUG JSON 解析尝试 {attempt+1}/{JSON_PARSE_RETRIES}")
-        result = _extract_json(response_text)
-        if result is not None:
-            print("[llm_client] DEBUG JSON 解析成功")
-            return result
+    payload = _build_payload(prompt, model=model, stream=False)
+    attempts = max(1, retries)
 
-        # 如果包含 OpenAI 风格 choices 结构，尝试再抽一层 content。
+    for attempt in range(attempts):
         try:
-            rsp_json = json.loads(response_text)
-            print("[llm_client] DEBUG JSON 解析失败后尝试解析 choices 结构")
-            if isinstance(rsp_json, dict) and "choices" in rsp_json:
-                choices = rsp_json.get("choices")
-                if choices and isinstance(choices, list):
-                    first = choices[0]
-                    content = None
-                    if isinstance(first, dict):
-                        content = first.get("message", {}).get("content") or first.get("text")
-                    if content:
-                        print(f"[llm_client] DEBUG 从 choices 抽取 content: {content[:500]}")
-                        response_text = content
-                        continue
-        except json.JSONDecodeError as e:
-            print(f"[llm_client] DEBUG JSONDecodeError: {e}")
+            print(f"[llm_client] DEBUG request_url={API_URL}")
+            print(f"[llm_client] DEBUG model={payload['model']}")
+            print(f"[llm_client] DEBUG attempt={attempt + 1}/{attempts}")
 
-        if attempt == JSON_PARSE_RETRIES - 1:
-            print("[llm_client] ERROR 连续解析失败，退出")
-            return None
+            resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT_SECONDS)
+            print(f"[llm_client] DEBUG status_code={resp.status_code}")
+            print(f"[llm_client] DEBUG response_preview={resp.text[:1000]}")
 
-    # 兜底分支：如果 result 是完整响应结构，再从 output.choices.message.content 抽问卷 JSON。
-    if result is not None:
-        content = result.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content")
-        if content:
-            print(f"[llm_client] DEBUG 提取 content: {content[:500]}")
-            survey_dict = _extract_json(content)
-            if survey_dict:
-                print("[llm_client] DEBUG 问卷 JSON 解析成功")
-                return survey_dict
-            else:
-                print("[llm_client] ERROR content 解析失败")
-        else:
-            print("[llm_client] ERROR 响应中无 content")
+            if resp.status_code != 200:
+                print(f"[llm_client] ERROR DeepSeek response_body={resp.text[:2000]}")
+                continue
+
+            try:
+                response_json = resp.json()
+            except ValueError as ex:
+                print(f"[llm_client] ERROR response is not valid JSON: {ex}")
+                continue
+
+            content = _extract_content_from_response(response_json)
+            if content:
+                return content
+
+            print("[llm_client] ERROR choices[0].message.content not found")
+        except requests.RequestException as err:
+            print(f"[llm_client] ERROR request failed: {err}")
+            traceback.print_exc()
 
     return None
 
 
-def call_llm_to_generate_survey(user_input: str, model: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    对外暴露：根据自然语言需求生成问卷。
-    """
-    prompt = _format_prompt_for_generation(user_input)
-    survey = _call_api(prompt, model=model)
-    if not survey or not isinstance(survey, dict):
+def _extract_stream_delta(event_obj: Dict[str, Any]) -> str:
+    try:
+        delta = event_obj["choices"][0].get("delta", {})
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+    content = delta.get("content")
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _call_api_stream(
+    prompt: str,
+    model: Optional[str] = None,
+    retries: int = JSON_PARSE_RETRIES,
+) -> Generator[str, None, None]:
+    headers = _build_headers()
+    if headers is None:
+        return
+
+    payload = _build_payload(prompt, model=model, stream=True)
+    attempts = max(1, retries)
+
+    for attempt in range(attempts):
+        try:
+            print(f"[llm_client] DEBUG request_url={API_URL}")
+            print(f"[llm_client] DEBUG model={payload['model']}")
+            print(f"[llm_client] DEBUG stream_attempt={attempt + 1}/{attempts}")
+
+            with requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT_SECONDS, stream=True) as resp:
+                print(f"[llm_client] DEBUG status_code={resp.status_code}")
+                if resp.status_code != 200:
+                    print(f"[llm_client] ERROR DeepSeek stream response_body={resp.text[:2000]}")
+                    continue
+
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if raw_line is None:
+                        continue
+                    line = raw_line.strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith(("event:", "id:", "retry:")):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line:
+                        continue
+                    if line == "[DONE]":
+                        return
+
+                    try:
+                        event_obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta = _extract_stream_delta(event_obj)
+                    if delta:
+                        yield delta
+                return
+        except requests.RequestException as err:
+            print(f"[llm_client] ERROR stream request failed: {err}")
+            traceback.print_exc()
+
+
+def _call_api(prompt: str, model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    content = _call_api_for_content(prompt, model=model, retries=JSON_PARSE_RETRIES)
+    if not content:
         return None
 
-    # 最基础结构校验：至少要有 title 和 questions。
-    if "title" not in survey or "questions" not in survey:
+    parsed = _extract_json(content) or _extract_json_loose(content)
+    if parsed is None:
+        print("[llm_client] ERROR model returned content, but survey JSON could not be parsed")
+        print(f"[llm_client] DEBUG raw_content_preview={content[:2000]}")
+    return parsed
+
+
+def call_llm_to_generate_survey(user_input: str, model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(user_input, str) or not user_input.strip():
+        print("[llm_client] ERROR user_input is empty")
+        return None
+
+    prompt = _format_prompt_for_generation(user_input)
+    survey = _call_api(prompt, model=model)
+    if not isinstance(survey, dict):
+        print("[llm_client] ERROR generation failed")
+        return None
+
+    if "title" not in survey or "questions" not in survey or not isinstance(survey.get("questions"), list):
+        print("[llm_client] WARNING generation result is incomplete, trying repair")
+        repaired = _repair_survey_json(survey, {"title": "未命名问卷", "description": "", "questions": []})
+        if isinstance(repaired, dict) and "title" in repaired and isinstance(repaired.get("questions"), list):
+            return repaired
+        print("[llm_client] ERROR generation result repair failed")
         return None
 
     return survey
+
+
+def call_llm_to_generate_survey_stream(
+    user_input: str,
+    model: Optional[str] = None,
+) -> Generator[str, None, None]:
+    if not isinstance(user_input, str) or not user_input.strip():
+        print("[llm_client] ERROR user_input is empty")
+        return
+
+    prompt = _format_prompt_for_generation(user_input)
+    yield from _call_api_stream(prompt, model=model, retries=JSON_PARSE_RETRIES)
+
+
+def parse_survey_from_text(text: str) -> Optional[Dict[str, Any]]:
+    candidate = _extract_json(text) or _extract_json_loose(text)
+    if isinstance(candidate, dict):
+        questions = candidate.get("questions")
+        if "title" in candidate and isinstance(questions, list):
+            return candidate
+
+    repaired = _repair_survey_json(
+        candidate if isinstance(candidate, dict) else text,
+        {"title": "未命名问卷", "description": "", "questions": []},
+    )
+    if repaired is None:
+        return None
+    if "title" not in repaired or "questions" not in repaired:
+        return None
+    if not isinstance(repaired.get("questions"), list):
+        return None
+    return repaired
 
 
 def call_llm_to_modify_survey(
@@ -319,19 +629,40 @@ def call_llm_to_modify_survey(
     modification: str,
     model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    对外暴露：基于当前问卷 + 修改指令，返回新问卷。
-    """
     if not isinstance(current_survey_dict, dict):
         return None
 
-    prompt = _format_prompt_for_modification(current_survey_dict, modification)
-    updated = _call_api(prompt, model=model)
-    if not updated or not isinstance(updated, dict):
-        return None
+    normalized_modification = _preprocess_modification(modification)
+    prompt = _format_prompt_for_modification(current_survey_dict, normalized_modification)
 
-    # 基础结构校验。
-    if "title" not in updated or "questions" not in updated:
-        return None
+    parse_attempts = max(1, JSON_PARSE_RETRIES)
+    last_content: Optional[str] = None
+    last_candidate: Optional[Dict[str, Any]] = None
 
-    return updated
+    for attempt in range(parse_attempts):
+        content = _call_api_for_content(prompt, model=model, retries=1)
+        if not content:
+            print(f"[llm_client] WARNING modify attempt {attempt + 1}/{parse_attempts} returned no content")
+            continue
+
+        last_content = content
+        updated = _extract_json(content) or _extract_json_loose(content)
+        if updated is None:
+            print(f"[llm_client] WARNING modify attempt {attempt + 1}/{parse_attempts} JSON parse failed")
+            continue
+
+        last_candidate = updated
+        if "title" in updated and "questions" in updated and isinstance(updated.get("questions"), list):
+            return updated
+
+        repaired = _repair_survey_json(updated, current_survey_dict)
+        if repaired is not None:
+            print("[llm_client] INFO modify result repaired")
+            return repaired
+
+    repaired_fallback = _repair_survey_json(last_candidate or last_content, current_survey_dict)
+    if repaired_fallback is not None:
+        print("[llm_client] INFO modify fallback repair succeeded")
+        return repaired_fallback
+
+    return None
